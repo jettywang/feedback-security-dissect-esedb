@@ -1,0 +1,63 @@
+==============================================================================
+ESE READ-ONLY FORENSIC TRIAGE REPORT
+==============================================================================
+Evidence file        : /Users/apple/Documents/用户反馈项目/run-control/first-five/jobs/FB-20261113-SEC10-095/workspace-002/incident_response/samples/basic.pristine.edb
+Access mode          : read-only (no writes, no flag edits, no replay)
+Structural parse     : parseable
+Transaction commit   : header-asserts-clean-shutdown
+
+-- Header facts
+  dbstate_name            : JET_dbstateCleanShutdown
+  dbtimeDirtied           : 403
+  page_size               : 4096
+  physical_pages          : 256
+  logical_pages           : 254
+  header_checksum_ok      : True
+  logtimeAttach           : 2022-08-19 11:46:32.952
+  logtimeDetach           : 2022-08-19 11:46:33.040
+  logtimeConsistent       : 2022-08-19 11:46:33.040
+  lgposConsistent_null    : False
+  lGenMinRequired         : 0
+  lGenMaxRequired         : 0
+  lGenMaxCommitted        : 0
+  signDb_ulRandom         : 0x87c3f09e
+  signLog_ulRandom        : 0x8999d81
+  shadow_dbstate_name     : JET_dbstateCleanShutdown
+  shadow_dbtimeDirtied    : 403
+  shadow_signDb_ulRandom  : 0x87c3f09e
+  shadow_mismatches       : []
+
+-- Page time coherence
+  header dbtimeDirtied  : 403
+  page dbtime range     : 70 .. 403
+  pages newer than hdr  : []
+
+-- Page inventory
+  logical_pages           : 254
+  zero_pages              : 231
+  new_checksum_pages      : 23
+  legacy_checksum_pages   : 0
+  large_page_first_block_only_checksums: 0
+  bad_reproducible_checksum: 0
+  parse_failures          : 0
+
+-- Catalog / directory coverage
+  orphan pages          : []
+  missing table roots   : []
+
+-- Decoded record counts (existence of bytes, not proof of commit)
+  MSysObjects             : 87 records, 0 iteration error(s)
+  MSysObjectsShadow       : 87 records, 0 iteration error(s)
+  MSysObjids              : 7 records, 0 iteration error(s)
+  MSysLocales             : 7 records, 0 iteration error(s)
+  basic                   : 2 records, 0 iteration error(s)
+
+-- Graded findings
+  [INFO    ] HDR_CLEAN: dbstate asserts clean shutdown. This is a header claim; verify it against page and checksum evidence.
+  [INFO    ] SHADOW_MATCH: Primary and shadow headers are consistent.
+  [INFO    ] PAGE_TIME_SPREAD: Pages span multiple dbtime values; this is normal for a live DB but proves mixed flush points.
+               distinct_values: 21
+               min: 70
+               max: 403
+
+Finding counts: CRITICAL=0, HIGH=0, MEDIUM=0, LOW=0, INFO=3

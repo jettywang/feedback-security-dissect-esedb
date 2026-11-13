@@ -1,0 +1,106 @@
+{
+  "source_fixture": "tests/_data/basic.edb.gz",
+  "source_sha256": "39f0370d0149288c758e818f8857aff9abc2a6d605f6dbf498c43390eb3fd711",
+  "page_size": 4096,
+  "scenarios": [
+    {
+      "sample": "basic.pristine.edb",
+      "path": "/private/tmp/claude-501/pytest-of-apple/pytest-2217/forensic_samples0/basic.pristine.edb",
+      "description": "Untouched clean-shutdown fixture used as the control sample.",
+      "mutations": [],
+      "sha256": "39f0370d0149288c758e818f8857aff9abc2a6d605f6dbf498c43390eb3fd711"
+    },
+    {
+      "sample": "dirty-shutdown.edb",
+      "path": "/private/tmp/claude-501/pytest-of-apple/pytest-2217/forensic_samples0/dirty-shutdown.edb",
+      "description": "Primary header rewritten to dirty shutdown with a newer dbtime and a null lgposConsistent; shadow header stays clean, producing a primary/shadow contradiction.",
+      "mutations": [
+        {
+          "offset": 52,
+          "field": "dbstate",
+          "new_value": 2
+        },
+        {
+          "offset": 16,
+          "field": "dbtimeDirtied",
+          "delta": 40
+        },
+        {
+          "offset": 56,
+          "field": "lgposConsistent",
+          "new_value": "null"
+        },
+        {
+          "offset": 64,
+          "field": "logtimeConsistent",
+          "new_value": "null"
+        }
+      ],
+      "sha256": "e1cb70896510859b81273e69ac288aa04a442d26f553758571ce794a72ea3b63"
+    },
+    {
+      "sample": "mixed-time-page.edb",
+      "path": "/private/tmp/claude-501/pytest-of-apple/pytest-2217/forensic_samples0/mixed-time-page.edb",
+      "description": "Logical page 14 carries a dbtimeDirtied newer than the database header, modelling a page merged from a later flush; its XOR checksum is regenerated but the ECC half is deliberately stale.",
+      "mutations": [
+        {
+          "logical_pgno": 14,
+          "field": "dbtimeDirtied",
+          "delta": 25
+        },
+        {
+          "field": "dbstate",
+          "new_value": 2
+        }
+      ],
+      "sha256": "02e15e8baa682dc589ea4f83c55e6b29d5ec019b9862e602a9d7b3f67c964580"
+    },
+    {
+      "sample": "missing-catalog-target.edb",
+      "path": "/private/tmp/claude-501/pytest-of-apple/pytest-2217/forensic_samples0/missing-catalog-target.edb",
+      "description": "Root page 31 referenced by the catalog row for table 'basic' is zeroed, modelling a missing directory target; the catalog claim and the page reality disagree.",
+      "mutations": [
+        {
+          "logical_pgno": 31,
+          "field": "whole-page",
+          "new_value": "zeroed"
+        },
+        {
+          "field": "dbstate",
+          "new_value": 2
+        }
+      ],
+      "sha256": "503afeede1d4a9fcc61e2201496b6c5a79264647746653a25fe8d43beeddc070"
+    },
+    {
+      "sample": "broken-btree-link.edb",
+      "path": "/private/tmp/claude-501/pytest-of-apple/pytest-2217/forensic_samples0/broken-btree-link.edb",
+      "description": "Leaf page 13 has pgnoNext rewritten to an out-of-range page number; ordered leaf traversal is unreliable even though individual pages still parse.",
+      "mutations": [
+        {
+          "logical_pgno": 13,
+          "field": "pgnoNext",
+          "new_value": 999
+        },
+        {
+          "field": "dbstate",
+          "new_value": 2
+        }
+      ],
+      "sha256": "c19543b51e383e9e3bb107d5d62fe6d86ada555af984dcb33fc9b27b41ed67ad"
+    },
+    {
+      "sample": "tampered-page.edb",
+      "path": "/private/tmp/claude-501/pytest-of-apple/pytest-2217/forensic_samples0/tampered-page.edb",
+      "description": "Two bytes inside logical page 14 are flipped without touching the checksum, modelling post-flash tampering; the header still claims clean shutdown to show why the header flag alone is not proof.",
+      "mutations": [
+        {
+          "logical_pgno": 14,
+          "file_offset": 61640,
+          "field": "data-bytes"
+        }
+      ],
+      "sha256": "9f527489e746b36cfebde71d65c4fe9e4bf16532d279b316289c4c4a4eb5afbb"
+    }
+  ]
+}

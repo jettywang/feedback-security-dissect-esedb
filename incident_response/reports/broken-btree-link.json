@@ -1,0 +1,332 @@
+{
+  "evidence_file": "/Users/apple/Documents/\u7528\u6237\u53cd\u9988\u9879\u76ee/run-control/first-five/jobs/FB-20261113-SEC10-095/workspace-002/incident_response/samples/broken-btree-link.edb",
+  "mode": "read-only",
+  "mutations_performed": [],
+  "replay_attempted": false,
+  "structural_parse_state": "parseable-with-errors",
+  "transaction_commit_state": "indeterminate-without-logs",
+  "header": {
+    "file": "/Users/apple/Documents/\u7528\u6237\u53cd\u9988\u9879\u76ee/run-control/first-five/jobs/FB-20261113-SEC10-095/workspace-002/incident_response/samples/broken-btree-link.edb",
+    "file_size": 1048576,
+    "page_size": 4096,
+    "physical_pages": 256,
+    "logical_pages": 254,
+    "ulVersion": 1568,
+    "format_major": 20,
+    "format_minor": 0,
+    "dbstate": 2,
+    "dbstate_name": "JET_dbstateDirtyShutdown",
+    "dbtimeDirtied": 403,
+    "header_checksum_ok": true,
+    "logtimeAttach": "2022-08-19 11:46:32.952",
+    "logtimeDetach": "2022-08-19 11:46:33.040",
+    "logtimeConsistent": "2022-08-19 11:46:33.040",
+    "lgposConsistent": {
+      "ib": 0,
+      "isec": 22,
+      "generation": 1
+    },
+    "lgposConsistent_null": false,
+    "lgposAttach": {
+      "ib": 616,
+      "isec": 20,
+      "generation": 1
+    },
+    "lgposDetach": {
+      "ib": 0,
+      "isec": 22,
+      "generation": 1
+    },
+    "lGenMinRequired": 0,
+    "lGenMaxRequired": 0,
+    "lGenMinConsistent": 0,
+    "lGenMaxCommitted": 0,
+    "signDb_ulRandom": "0x87c3f09e",
+    "signLog_ulRandom": "0x8999d81",
+    "logtimeCreate": "2022-08-19 11:46:32.636",
+    "computer": "",
+    "shadow_dbstate": 3,
+    "shadow_dbstate_name": "JET_dbstateCleanShutdown",
+    "shadow_dbtimeDirtied": 403,
+    "shadow_signDb_ulRandom": "0x87c3f09e",
+    "shadow_mismatches": [
+      {
+        "field": "dbstate",
+        "primary": 2,
+        "shadow": 3
+      }
+    ]
+  },
+  "pages": {
+    "logical_pages": 254,
+    "zero_pages": 231,
+    "new_checksum_pages": 23,
+    "legacy_checksum_pages": 0,
+    "large_page_first_block_only_checksums": 0,
+    "bad_reproducible_checksum": 0,
+    "parse_failures": 0
+  },
+  "page_time": {
+    "distinct_dbtimeDirtied": [
+      70,
+      77,
+      84,
+      98,
+      272,
+      274,
+      276,
+      292,
+      294,
+      345,
+      346,
+      350,
+      353,
+      392,
+      393,
+      395,
+      397,
+      399,
+      400,
+      401,
+      403
+    ],
+    "header_dbtimeDirtied": 403,
+    "pages_newer_than_header": [],
+    "min_page_dbtime": 70,
+    "max_page_dbtime": 403
+  },
+  "btree": {
+    "catalog": {
+      "root_page": 4,
+      "reachable_pages": [
+        4,
+        13,
+        14
+      ],
+      "parse_error": null
+    },
+    "tables": [
+      {
+        "name": "MSysObjects",
+        "root_page": 4,
+        "long_value_root": null,
+        "secondary_index_roots": [
+          7,
+          10
+        ],
+        "reachable_pages": [
+          4,
+          13,
+          14
+        ],
+        "columns": 28,
+        "indices": 3
+      },
+      {
+        "name": "MSysObjectsShadow",
+        "root_page": 24,
+        "long_value_root": null,
+        "secondary_index_roots": [],
+        "reachable_pages": [
+          24,
+          27,
+          28
+        ],
+        "columns": 28,
+        "indices": 1
+      },
+      {
+        "name": "MSysObjids",
+        "root_page": 29,
+        "long_value_root": null,
+        "secondary_index_roots": [],
+        "reachable_pages": [
+          29
+        ],
+        "columns": 3,
+        "indices": 1
+      },
+      {
+        "name": "MSysLocales",
+        "root_page": 30,
+        "long_value_root": null,
+        "secondary_index_roots": [],
+        "reachable_pages": [
+          30
+        ],
+        "columns": 3,
+        "indices": 1
+      },
+      {
+        "name": "basic",
+        "root_page": 31,
+        "long_value_root": null,
+        "secondary_index_roots": [],
+        "reachable_pages": [
+          31
+        ],
+        "columns": 13,
+        "indices": 1
+      }
+    ],
+    "coverage": {
+      "allocated_nonzero_pages": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "referenced_tree_pages": [
+        4,
+        7,
+        10,
+        13,
+        14,
+        15,
+        24,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "long_value_pages": [],
+      "orphan_pages": [],
+      "missing_roots": []
+    },
+    "flag_breakdown": {
+      "Root": 18,
+      "Leaf": 20,
+      "NewRecordFormat": 23,
+      "NewChecksumFormat": 23,
+      "SpaceTree": 10,
+      "ParentOfLeaf": 3,
+      "Index": 7
+    },
+    "records": [
+      {
+        "table": "MSysObjects",
+        "records_decoded": 87,
+        "iteration_errors": 0
+      },
+      {
+        "table": "MSysObjectsShadow",
+        "records_decoded": 87,
+        "iteration_errors": 0
+      },
+      {
+        "table": "MSysObjids",
+        "records_decoded": 7,
+        "iteration_errors": 0
+      },
+      {
+        "table": "MSysLocales",
+        "records_decoded": 7,
+        "iteration_errors": 0
+      },
+      {
+        "table": "basic",
+        "records_decoded": 2,
+        "iteration_errors": 0
+      }
+    ]
+  },
+  "finding_counts": {
+    "CRITICAL": 0,
+    "HIGH": 4,
+    "MEDIUM": 0,
+    "LOW": 0,
+    "INFO": 1
+  },
+  "findings": [
+    {
+      "severity": "HIGH",
+      "code": "HDR_DIRTY",
+      "message": "dbstate is JET_dbstateDirtyShutdown, not clean shutdown; committed state cannot be asserted without logs.",
+      "detail": {
+        "dbstate": 2,
+        "lgposConsistent_null": false
+      }
+    },
+    {
+      "severity": "HIGH",
+      "code": "SHADOW_DIVERGENCE",
+      "message": "Primary and shadow headers disagree; the file mixes at least two header flush points.",
+      "detail": {
+        "mismatches": [
+          {
+            "field": "dbstate",
+            "primary": 2,
+            "shadow": 3
+          }
+        ]
+      }
+    },
+    {
+      "severity": "HIGH",
+      "code": "BTREE_LINK_OOB",
+      "message": "One or more sibling page links point outside the file.",
+      "detail": {
+        "links": [
+          {
+            "logical_pgno": 13,
+            "field": "pgnoNext",
+            "target": 999
+          }
+        ]
+      }
+    },
+    {
+      "severity": "INFO",
+      "code": "PAGE_TIME_SPREAD",
+      "message": "Pages span multiple dbtime values; this is normal for a live DB but proves mixed flush points.",
+      "detail": {
+        "distinct_values": 21,
+        "min": 70,
+        "max": 403
+      }
+    },
+    {
+      "severity": "HIGH",
+      "code": "BTREE_LINK",
+      "message": "B-tree branch or leaf sibling links are broken; ordered traversal is not reliable.",
+      "detail": {
+        "errors": [
+          {
+            "table": "MSysObjects",
+            "code": "next-out-of-bounds",
+            "page": 13,
+            "target": 999
+          },
+          {
+            "table": "MSysObjects",
+            "code": "non-reciprocal-prev",
+            "page": 14,
+            "prev": 13,
+            "prev_next": 999
+          }
+        ],
+        "total_errors": 2
+      }
+    }
+  ]
+}
