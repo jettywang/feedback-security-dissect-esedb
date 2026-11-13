@@ -7,6 +7,29 @@ from dissect.util.compression import lzxpress, sevenbit
 from dissect.esedb.c_esedb import COMPRESSION_SCHEME
 
 
+def scheme(buf: bytes) -> COMPRESSION_SCHEME | None:
+    """Return the compression scheme advertised by the given bytes, if any.
+
+    The compression scheme identifier is stored in the upper 5 bits of the first byte. A scheme of
+    ``COMPRESS_NONE`` is reported as ``None``.
+
+    Args:
+        buf: The (possibly compressed) bytes to inspect.
+
+    Raises:
+        ValueError: If the bytes do not advertise a known compression scheme.
+    """
+    if not buf:
+        raise ValueError("cannot determine compression scheme of empty data")
+
+    identifier = buf[0] >> 3
+    scheme = COMPRESSION_SCHEME(identifier)
+    if scheme not in COMPRESSION_SCHEME.__members__.values():
+        raise ValueError(f"unknown compression scheme: {identifier}")
+
+    return None if scheme == COMPRESSION_SCHEME.COMPRESS_NONE else scheme
+
+
 def decompress(buf: bytes) -> bytes:
     """Decompress the given bytes according to the encoded compression scheme.
 

@@ -9,12 +9,14 @@ from dissect.esedb.btree import BTree
 from dissect.esedb.c_esedb import (
     CODEPAGE,
     COLUMN_TYPE_MAP,
+    COMPRESSION_SCHEME,
     SYSOBJ,
+    TAG_FLAG,
     ColumnType,
     JET_coltyp,
     RecordValue,
 )
-from dissect.esedb.exceptions import NoNeighbourPageError
+from dissect.esedb.exceptions import LongValueError, NoNeighbourPageError
 from dissect.esedb.index import Index
 from dissect.esedb.record import Record
 
@@ -24,6 +26,67 @@ if TYPE_CHECKING:
     from dissect.esedb.cursor import Cursor
     from dissect.esedb.esedb import EseDB
     from dissect.esedb.page import Page
+
+
+class LongValueChunk:
+    """Evidence of a single long value chunk as it was read from the database.
+
+    Attributes:
+        key: The full B-tree key of the chunk, including the value identifier and chunk offset.
+        offset: The logical offset of the chunk within the long value, decoded from the key.
+        data: The raw chunk data as stored on the page.
+        page: The logical page number the chunk was read from.
+        tag: The tag number on that page.
+        node: The node index on that page.
+        length: The stored length of the raw chunk data.
+        tag_flags: The tag flags of the chunk node, including whether the page marked it compressed.
+        decompressed_size: The validated logical size of the chunk after decompression.
+        compression: The compression scheme used for this chunk, or ``None`` if not yet known.
+        value: The logical bytes of the chunk after any decompression, or ``None`` if not yet known.
+    """
+
+    __slots__ = (
+        "compression",
+        "data",
+        "decompressed_size",
+        "key",
+        "length",
+        "node",
+        "offset",
+        "page",
+        "tag",
+        "tag_flags",
+        "value",
+    )
+
+    def __init__(
+        self,
+        key: bytes,
+        offset: int,
+        data: bytes,
+        page: int,
+        tag: int,
+        node: int,
+        tag_flags: TAG_FLAG,
+    ):
+        self.key = key
+        self.offset = offset
+        self.data = data
+        self.page = page
+        self.tag = tag
+        self.node = node
+        self.tag_flags = tag_flags
+        self.length = len(data)
+
+        self.decompressed_size = None
+        self.compression = None
+        self.value = None
+
+    def __repr__(self) -> str:
+        return (
+            f"<LongValueChunk offset={self.offset} length={self.length} "
+            f"page={self.page} tag={self.tag} compression={self.compression}>"
+        )
 
 
 class Table:
@@ -186,42 +249,288 @@ class Table:
     def get_long_value(self, key: bytes) -> bytes:
         """Retrieve a value from the long value page of the table.
 
+        The value is stored as a contiguous sequence of chunks. Each chunk key extends the (reversed)
+        lookup key with a big-endian start offset of the chunk within the logical value. Chunks are
+        only accepted when they belong to this exact value, are strictly ordered and cover the
+        declared length without gaps or overlaps. A chunk is considered compressed only when its
+        stored length differs from the expected logical length *and* its data advertises a supported
+        compression scheme.
+
         Args:
             key: The lookup key for the long value.
+
+        Raises:
+            LongValueError: If the value is incomplete, overlapping, out of order, contains foreign
+                chunks or does not match the declared length. The exception carries the evidence of
+                every chunk that was read, including page and tag numbers.
         """
+        return self.get_long_value_chunks(key)[0]
+
+    def get_long_value_chunks(self, key: bytes) -> tuple[bytes, list[LongValueChunk]]:
+        """Retrieve a long value together with the evidence of the chunks it was assembled from.
+
+        This is equivalent to :meth:`get_long_value`, but also returns :class:`LongValueChunk`
+        instances describing every chunk that contributed to the result, including its key, offset,
+        page, tag and compression state.
+
+        Args:
+            key: The lookup key for the long value.
+
+        Raises:
+            LongValueError: If the value cannot be assembled unambiguously.
+        """
+        chunks = []
+        data = self._get_long_value(key, chunks)
+        return data, chunks
+
+    def _get_long_value(self, key: bytes, chunks: list[LongValueChunk]) -> bytes:
         rkey = key[::-1]
         btree = BTree(self.esedb, self.lv_page)
         header = btree.search(rkey)
 
+        if len(header.data) < 8:
+            raise LongValueError(
+                "Long value header is too small to contain an identifier and declared size",
+                key=key,
+                evidence=chunks,
+            )
+
         _, size = struct.unpack("<2I", header.data)
-        chunks = []
-        chunk_offsets = []
+
+        if size == 0:
+            return b""
+
+        self._collect_long_value_chunks(key, rkey, size, btree, chunks)
+
+        buf = []
+        offset = 0
+        for i, chunk in enumerate(chunks):
+            if chunk.offset != offset:
+                expected = "start" if i == 0 else f"offset {offset}"
+                raise LongValueError(
+                    f"Long value chunk is out of order or has a gap: chunk offset {chunk.offset} "
+                    f"does not match {expected}",
+                    key=key,
+                    declared_size=size,
+                    chunk=chunk,
+                    evidence=chunks[: i + 1],
+                )
+
+            next_offset = chunks[i + 1].offset if i + 1 < len(chunks) else size
+            expected_size = next_offset - chunk.offset
+
+            chunk.decompressed_size = expected_size
+            if chunk.length == expected_size:
+                # A matching stored length is authoritative, even if the first byte happens to look
+                # like a compression scheme identifier.
+                chunk.compression = COMPRESSION_SCHEME.COMPRESS_NONE
+                chunk.value = chunk.data
+                buf.append(chunk.data)
+            else:
+                chunk, data = self._decompress_long_value_chunk(
+                    key, size, chunk, expected_size, chunks[: i + 1], has_next=i + 1 < len(chunks)
+                )
+                buf.append(data)
+
+            offset = next_offset
+
+        data = b"".join(buf)
+        if len(data) != size:
+            raise LongValueError(
+                f"Long value length mismatch: assembled {len(data)} bytes, header declares {size}",
+                key=key,
+                declared_size=size,
+                evidence=chunks,
+            )
+
+        return data
+
+    def _collect_long_value_chunks(
+        self, key: bytes, rkey: bytes, size: int, btree: BTree, chunks: list[LongValueChunk]
+    ) -> None:
+        """Collect and validate the chunk sequence for a single long value."""
+        previous_offset = -1
 
         while True:
             try:
                 node = btree.next()
-                if not node.key.startswith(rkey):
-                    break
             except NoNeighbourPageError:
                 break
 
-            chunks.append(node.data)
+            if not node.key.startswith(rkey):
+                # Reached the header or chunks of the next long value, stop before mixing them in.
+                break
 
-            chunk_offset = struct.unpack(">I", node.key[-4:])[0]
-            chunk_offsets.append(chunk_offset)
+            chunk = LongValueChunk(
+                key=bytes(node.key),
+                offset=struct.unpack(">I", node.key[-4:])[0] if len(node.key) >= len(rkey) + 4 else -1,
+                data=bytes(node.data),
+                page=node.tag.page.num,
+                tag=node.tag.num,
+                node=node.num,
+                tag_flags=node.tag.flags,
+            )
 
-        chunk_offsets.append(size)
+            if len(node.key) == len(rkey):
+                raise LongValueError(
+                    "Duplicate long value header encountered while reading chunks",
+                    key=key,
+                    declared_size=size,
+                    chunk=chunk,
+                    evidence=[*chunks, chunk],
+                )
 
-        buf = []
-        chunk_offset = 0
-        for chunk, next_chunk_offset in zip(chunks, chunk_offsets[1:], strict=False):
-            # Chunk sizes should be used to determine if a chunk is compressed
-            if len(chunk) != next_chunk_offset - chunk_offset:
-                chunk = compression.decompress(chunk)
-            buf.append(chunk)
-            chunk_offset += next_chunk_offset
+            if len(node.key) != len(rkey) + 4:
+                raise LongValueError(
+                    f"Malformed long value chunk key: expected {len(rkey) + 4} bytes, got {len(node.key)}",
+                    key=key,
+                    declared_size=size,
+                    chunk=chunk,
+                    evidence=[*chunks, chunk],
+                )
 
-        return b"".join(buf)
+            if chunk.offset >= size:
+                raise LongValueError(
+                    f"Long value chunk offset {chunk.offset} exceeds declared size {size}",
+                    key=key,
+                    declared_size=size,
+                    chunk=chunk,
+                    evidence=[*chunks, chunk],
+                )
+
+            if chunk.offset <= previous_offset:
+                raise LongValueError(
+                    f"Duplicate or out of order long value chunk offset {chunk.offset} "
+                    f"(previous offset {previous_offset})",
+                    key=key,
+                    declared_size=size,
+                    chunk=chunk,
+                    evidence=[*chunks, chunk],
+                )
+
+            if chunk.length == 0:
+                raise LongValueError(
+                    "Empty long value chunk encountered",
+                    key=key,
+                    declared_size=size,
+                    chunk=chunk,
+                    evidence=[*chunks, chunk],
+                )
+
+            chunks.append(chunk)
+            previous_offset = chunk.offset
+
+        if not chunks:
+            raise LongValueError(
+                f"Long value declares {size} bytes but has no chunks",
+                key=key,
+                declared_size=size,
+                evidence=[],
+            )
+
+        if chunks[0].offset != 0:
+            raise LongValueError(
+                f"Long value is missing its first chunk: first chunk starts at offset {chunks[0].offset}",
+                key=key,
+                declared_size=size,
+                chunk=chunks[0],
+                evidence=chunks,
+            )
+
+        # At this point only the offsets are known. A chunk that is shorter than the distance to the
+        # next chunk is ambiguous: it is either compressed or truncated, which is resolved during
+        # assembly. A chunk that is longer, however, unconditionally overlaps its neighbour (or the
+        # declared end of the value) and can never be valid.
+        for i, current in enumerate(chunks):
+            next_offset = chunks[i + 1].offset if i + 1 < len(chunks) else size
+            if current.length > next_offset - current.offset:
+                raise LongValueError(
+                    f"Long value chunk at offset {current.offset} is {current.length} bytes long but "
+                    f"ends at offset {next_offset}, causing an overlap",
+                    key=key,
+                    declared_size=size,
+                    chunk=current,
+                    evidence=chunks[: i + 1],
+                )
+
+    def _decompress_long_value_chunk(
+        self,
+        key: bytes,
+        size: int,
+        chunk: LongValueChunk,
+        expected_size: int,
+        evidence: list[LongValueChunk],
+        has_next: bool,
+    ) -> tuple[LongValueChunk, bytes]:
+        """Decompress a chunk after verifying that it actually advertises a compression scheme."""
+        try:
+            scheme = compression.scheme(chunk.data)
+        except ValueError as e:
+            raise LongValueError(
+                f"Long value chunk length {chunk.length} does not match expected size {expected_size} "
+                "and does not advertise a known compression scheme",
+                key=key,
+                declared_size=size,
+                chunk=chunk,
+                evidence=evidence,
+            ) from e
+
+        if scheme is None:
+            if has_next and chunk.length < expected_size:
+                raise LongValueError(
+                    f"Long value chunk at offset {chunk.offset} is {chunk.length} bytes but the next chunk "
+                    f"starts at offset {chunk.offset + expected_size}, leaving a gap of "
+                    f"{expected_size - chunk.length} bytes",
+                    key=key,
+                    declared_size=size,
+                    chunk=chunk,
+                    evidence=evidence,
+                )
+
+            raise LongValueError(
+                f"Long value chunk length {chunk.length} does not match expected size {expected_size} "
+                "but is not compressed",
+                key=key,
+                declared_size=size,
+                chunk=chunk,
+                evidence=evidence,
+            )
+
+        if scheme == COMPRESSION_SCHEME.COMPRESS_SCRUB:
+            raise LongValueError(
+                f"Long value chunk at offset {chunk.offset} advertises the unsupported SCRUB compression scheme",
+                key=key,
+                declared_size=size,
+                chunk=chunk,
+                evidence=evidence,
+            )
+
+        if scheme in (COMPRESSION_SCHEME.COMPRESS_XPRESS9, COMPRESSION_SCHEME.COMPRESS_XPRESS10):
+            raise NotImplementedError(f"Compression not yet implemented: {scheme}")
+
+        try:
+            data = compression.decompress(chunk.data)
+        except Exception as e:
+            raise LongValueError(
+                f"Failed to decompress long value chunk ({scheme}): {e}",
+                key=key,
+                declared_size=size,
+                chunk=chunk,
+                evidence=evidence,
+            ) from e
+
+        if len(data) != expected_size:
+            raise LongValueError(
+                f"Decompressed long value chunk ({scheme}) is {len(data)} bytes, expected {expected_size}",
+                key=key,
+                declared_size=size,
+                chunk=chunk,
+                evidence=evidence,
+            )
+
+        chunk.compression = scheme
+        chunk.value = data
+        return chunk, data
 
     def _add_column(self, column: Column) -> None:
         """Add a column to the table."""
