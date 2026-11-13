@@ -5,12 +5,15 @@ from dissect.esedb.exceptions import (
     KeyNotFoundError,
     NoNeighbourPageError,
 )
+from dissect.esedb.record import FieldInfo, ValueSource
 
 __all__ = [
     "CompressedTaggedDataError",
     "Error",
     "EseDB",
+    "FieldInfo",
     "InvalidDatabase",
     "KeyNotFoundError",
     "NoNeighbourPageError",
+    "ValueSource",
 ]

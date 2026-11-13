@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import enum
 import functools
 import struct
 from binascii import hexlify
+from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from dissect.util.xmemoryview import xmemoryview
 
@@ -20,6 +22,99 @@ if TYPE_CHECKING:
 
 def noop(value: Any) -> Any:
     return value
+
+
+class ValueSource(enum.Enum):
+    """The source of a record field value.
+
+    Allows distinguishing between values that look the same when displayed, but have different on-disk evidence.
+
+    Attributes:
+        STORED: The value is physically stored in the record.
+        EMPTY: The value is physically stored in the record as zero-length data.
+        NULL: The value is explicitly stored as NULL in the record.
+        DEFAULT: The value is not stored in the record, the column default is used instead.
+        MISSING: The value is not stored in the record and the column has no default.
+        CORRUPT: The value is stored in the record but could not be parsed.
+    """
+
+    STORED = "stored"
+    EMPTY = "empty"
+    NULL = "null"
+    DEFAULT = "default"
+    MISSING = "missing"
+    CORRUPT = "corrupt"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass
+class FieldInfo:
+    """Provenance information about the value of a single column in a record.
+
+    Both the raw and the parsed interpretation of the value are derived from the same source determination,
+    so they are always consistent with each other and with what :meth:`Record.get` returns.
+
+    Attributes:
+        column: The column definition this value belongs to.
+        source: The source of the value.
+        value: The parsed value, identical to what :meth:`Record.get` returns.
+        raw: The raw data as stored, identical to what ``Record.get(raw=True)`` returns.
+        offset: The offset of the value within the record data, or ``None`` if it's not stored in the record.
+        size: The size of the value within the record data, or ``None`` if it's not stored in the record.
+        tag_field: The :class:`TagField` of the value if it's a tagged column, ``None`` otherwise.
+        error: The parse error if the source is :attr:`ValueSource.CORRUPT`, ``None`` otherwise.
+    """
+
+    column: Column
+    source: ValueSource
+    value: RecordValue
+    raw: bytes | None
+    offset: int | None
+    size: int | None
+    tag_field: TagField | None = field(default=None, compare=False)
+    error: str | None = None
+
+    @property
+    def is_stored(self) -> bool:
+        """Return whether the value is physically stored in the record."""
+        return self.source is ValueSource.STORED
+
+    @property
+    def is_empty(self) -> bool:
+        """Return whether the value is stored in the record as zero-length data."""
+        return self.source is ValueSource.EMPTY
+
+    @property
+    def is_null(self) -> bool:
+        """Return whether the value is explicitly stored as NULL in the record."""
+        return self.source is ValueSource.NULL
+
+    @property
+    def is_default(self) -> bool:
+        """Return whether the value comes from the column default."""
+        return self.source is ValueSource.DEFAULT
+
+    @property
+    def is_missing(self) -> bool:
+        """Return whether the value is not stored in the record and has no default."""
+        return self.source is ValueSource.MISSING
+
+    @property
+    def is_corrupt(self) -> bool:
+        """Return whether the value is stored in the record but could not be parsed."""
+        return self.source is ValueSource.CORRUPT
+
+
+class _FieldData(NamedTuple):
+    """Internal intermediate representation of a record field value and its provenance."""
+
+    source: ValueSource
+    value: bytes | None
+    offset: int | None
+    size: int | None
+    tag_field: TagField | None = None
 
 
 class Record:
@@ -107,6 +202,16 @@ class Record:
         """
         column = self._table.column(attr)
         return self._data.get(column, raw)
+
+    def field_info(self, attr: str, errors: str | None = "backslashreplace") -> FieldInfo:
+        """Retrieve provenance information for the value of the column with the given name.
+
+        Args:
+            attr: The column name to retrieve the value provenance of.
+            errors: Error handling scheme to use when decoding bytes to text (default: 'backslashreplace').
+        """
+        column = self._table.column(attr)
+        return self._data.field_info(column, errors)
 
     def as_dict(self, raw: bool = False) -> dict[str, RecordValue]:
         return self._data.as_dict(raw)
@@ -208,20 +313,8 @@ class RecordData:
             raw: Whether to return the raw data stored in the record instead of the parsed value.
             errors: Error handling scheme to use when decoding bytes to text (default: 'backslashreplace').
         """
-        value = None
-        tag_field = None
-
-        if self.header is None:
-            return value
-
-        if column.is_fixed:
-            value = self._get_fixed(column)
-
-        elif column.is_variable:
-            value = self._get_variable(column)
-
-        elif column.is_tagged:
-            tag_field, value = self._get_tagged(column)
+        field = self._get_field(column)
+        value = field.value
 
         if raw:
             if isinstance(value, memoryview):
@@ -229,9 +322,66 @@ class RecordData:
             return value
 
         if value is not None:
-            return self._parse_value(column, value, tag_field, errors)
+            return self._parse_value(column, value, field.tag_field, errors)
 
         return None
+
+    def field_info(self, column: Column, errors: str | None = "backslashreplace") -> FieldInfo:
+        """Retrieve provenance information for the value of the specified column.
+
+        Both the raw and the parsed interpretation are derived from the same source determination, so they are
+        always consistent with each other. Values that fail to parse are reported with a
+        :attr:`ValueSource.CORRUPT` source instead of raising an exception.
+
+        Args:
+            column: The column to retrieve the value provenance of.
+            errors: Error handling scheme to use when decoding bytes to text (default: 'backslashreplace').
+        """
+        field = self._get_field(column)
+        source = field.source
+
+        raw = field.value
+        if isinstance(raw, memoryview):
+            raw = raw.tobytes()
+
+        value = None
+        error = None
+        if raw is not None:
+            try:
+                value = self._parse_value(column, raw, field.tag_field, errors)
+            except Exception as e:
+                source = ValueSource.CORRUPT
+                error = f"{type(e).__name__}: {e}"
+
+        return FieldInfo(
+            column=column,
+            source=source,
+            value=value,
+            raw=raw,
+            offset=field.offset,
+            size=field.size,
+            tag_field=field.tag_field,
+            error=error,
+        )
+
+    def _get_field(self, column: Column) -> _FieldData:
+        """Retrieve the raw value and provenance of the specified column from the record."""
+        if self.header is None:
+            return _FieldData(ValueSource.MISSING, None, None, None)
+
+        if column.is_fixed:
+            return self._get_fixed(column)
+
+        if column.is_variable:
+            return self._get_variable(column)
+
+        return self._get_tagged(column)
+
+    def _get_default(self, column: Column) -> _FieldData:
+        """Return the provenance for a column that is not stored in the record."""
+        if column.default is not None:
+            return _FieldData(ValueSource.DEFAULT, column.default, None, None)
+        return _FieldData(ValueSource.MISSING, None, None, None)
 
     def as_dict(self, raw: bool = False, errors: str | None = "backslashreplace") -> dict[str, RecordValue]:
         """Serialize the record as a dictionary."""
@@ -301,6 +451,10 @@ class RecordData:
     def _parse_multivalue(self, value: bytes, tag_field: TagField) -> list[bytes]:
         fSeparatedInstance = 0x8000
 
+        if len(value) == 0:
+            # An empty multi-value list is stored as zero-length data
+            return []
+
         if tag_field.flags & TAGFLD_HEADER.TwoValues:
             # Optimized storage for when a multi-value only has two values
             # First byte is the size of the first value, calculate the size of the second value from that
@@ -332,26 +486,28 @@ class RecordData:
 
         return value
 
-    def _get_fixed(self, column: Column) -> bytes | None:
+    def _get_fixed(self, column: Column) -> _FieldData:
         """Parse a specific fixed column."""
         if column.identifier <= self._last_fixed_id:
+            # Fixed data starts right after the header, which is 4 bytes
+            offset = 4 + column.offset
+            size = column.size
+
             # Check if it's not null
             bit_idx_identifier = column.identifier - 1
             bitmap_offset, bitmap_shift = divmod(bit_idx_identifier, 8)
             if self._fixed_null_bitmap[bitmap_offset] & (1 << bitmap_shift):
-                return None
+                return _FieldData(ValueSource.NULL, None, offset, size)
 
-            # Fixed data starts right after the header, which is 4 bytes
-            offset = 4 + column.offset
-            value = self.data[offset : offset + column.size]
-        else:
-            # If the column has a default, use that
-            # If not, this defaults to None
-            value = column.default
+            value = self.data[offset : offset + size]
+            source = ValueSource.EMPTY if len(value) == 0 else ValueSource.STORED
+            return _FieldData(source, value, offset, size)
 
-        return value
+        # If the column has a default, use that
+        # If not, this defaults to None
+        return self._get_default(column)
 
-    def _get_variable(self, column: Column) -> bytes | None:
+    def _get_variable(self, column: Column) -> _FieldData:
         """Parse a specific variable column."""
         if column.identifier <= self._last_variable_id:
             identifier_idx = column.identifier - 128
@@ -363,43 +519,51 @@ class RecordData:
             # The value at the own index is the end offset of this value
             value_end = self._variable_offsets[identifier_idx]
 
+            # Offset everything with the variable data value starting offset
+            offset = self._variable_data_start + value_start
+            size = (value_end & 0x7FFF) - value_start
+
             # If the MSB has been set, it means the entry is empty
-            if value_end & 0x8000 == 0:
-                # Offset everything with the variable data value starting offset
-                value_offset = self._variable_data_start
-                value = self.data[value_offset + value_start : value_offset + value_end]
-            else:
-                value = None
-        else:
-            # If the column has a default, use that
-            # If not, this defaults to None
-            value = column.default
+            if value_end & 0x8000:
+                return _FieldData(ValueSource.NULL, None, offset, size)
 
-        return value
+            value = self.data[offset : offset + size]
+            source = ValueSource.EMPTY if size == 0 else ValueSource.STORED
+            return _FieldData(source, value, offset, size)
 
-    def _get_tagged(self, column: Column) -> bytes | None:
+        # If the column has a default, use that
+        # If not, this defaults to None
+        return self._get_default(column)
+
+    def _get_tagged(self, column: Column) -> _FieldData:
         """Parse a specific tagged column."""
-        tag_field = None
-
         idx = self._find_tag_field_idx(column.identifier)
-        if idx is not None:
-            tag_field = self._get_tag_field(idx)
-
-            data_start = tag_field.offset
-            if tag_field.has_extended_info:
-                data_start += 1
-
-            data_end = self._get_tag_field(idx + 1).offset if idx + 1 < self._tagged_data_count else len(self.data)
-
-            if not tag_field.is_null:
-                offset = self._tagged_data_start
-                value = self.data[offset + data_start : offset + data_end]
-        else:
+        if idx is None:
             # If the column has a default, use that
             # If not, this defaults to None
-            value = column.default
+            return self._get_default(column)
 
-        return tag_field, value
+        tag_field = self._get_tag_field(idx)
+
+        data_start = tag_field.offset
+        if tag_field.has_extended_info:
+            data_start += 1
+
+        data_end = (
+            self._get_tag_field(idx + 1).offset
+            if idx + 1 < self._tagged_data_count
+            else len(self.data) - self._tagged_data_start
+        )
+
+        offset = self._tagged_data_start + data_start
+        size = data_end - data_start
+
+        if tag_field.is_null:
+            return _FieldData(ValueSource.NULL, None, offset, size, tag_field)
+
+        value = self.data[offset : offset + size]
+        source = ValueSource.EMPTY if size == 0 else ValueSource.STORED
+        return _FieldData(source, value, offset, size, tag_field)
 
     def _get_tag_field(self, idx: int) -> TagField:
         """Retrieve the :class:`TagField` at the given index in the ``TAGFLD`` array."""
