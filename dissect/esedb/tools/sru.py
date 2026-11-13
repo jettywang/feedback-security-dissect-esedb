@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
 
@@ -29,6 +30,25 @@ SKIP_TABLES = [
     "SruDbIdMapTable",
     "SruDbCheckpointTable",
 ]
+
+# ``SruDbIdMapTable.IdType`` discriminates the kind of identifier stored in ``IdBlob``.
+# The application providers reference the UTF-16 string types, while ``UserId`` columns reference the SID type.
+# These values are derived from the on-disk data: every non-null ``AppId`` reference resolves to one of the string
+# types (0, 2, 4), while every non-null ``UserId`` reference resolves to the SID type (3).
+ID_TYPE_SID = 3
+ID_TYPE_STRING = frozenset((0, 1, 2, 4))
+
+# Columns that carry an identity reference and the identifier type that is valid for them.
+APP_ID = "AppId"
+USER_ID = "UserId"
+IDENTITY_COLUMNS = {APP_ID, USER_ID}
+EXPECTED_ID_TYPES = {
+    APP_ID: ID_TYPE_STRING,
+    USER_ID: frozenset((ID_TYPE_SID,)),
+}
+
+# Sentinel for an identity that cannot be attributed to a single, type-correct value.
+UNDETERMINED = "<undetermined>"
 
 
 NAME_TO_GUID_MAP = {
@@ -59,7 +79,60 @@ class SRU:
         self.esedb = EseDB(fh)
 
         id_map_table = self.esedb.table("SruDbIdMapTable")
-        self.id_map = {r.get("IdIndex"): r for r in id_map_table.records()}
+        self.id_map = self._build_id_map(id_map_table)
+
+    def _build_id_map(self, id_map_table: Table) -> dict[int, IdMapping]:
+        """Index every ``SruDbIdMapTable`` row by ``IdIndex`` without discarding duplicates.
+
+        A single ``IdIndex`` may occur more than once with different ``IdType``/``IdBlob`` values. Such conflicts are
+        preserved on the resulting :class:`IdMapping` instead of one row silently overwriting another.
+        """
+        id_map: dict[int, IdMapping] = {}
+        for record in id_map_table.records():
+            id_index = record.get("IdIndex")
+            id_type = record.get("IdType")
+            id_blob = record.get("IdBlob")
+            if isinstance(id_blob, memoryview):
+                id_blob = id_blob.tobytes()
+
+            mapping = id_map.get(id_index)
+            if mapping is None:
+                mapping = IdMapping(id_index=id_index)
+                id_map[id_index] = mapping
+
+            value, error = self._decode_blob(id_type, id_blob)
+            mapping.records.append(IdRecord(id_type=id_type, id_blob=id_blob, value=value, error=error))
+
+        for mapping in id_map.values():
+            mapping.conflicts = mapping._detect_conflicts()
+
+        return id_map
+
+    @staticmethod
+    def _decode_blob(id_type: int | None, id_blob: bytes | None) -> tuple[str | None, str | None]:
+        """Interpret an ``IdBlob`` according to its ``IdType``.
+
+        Returns a ``(value, error)`` tuple. ``error`` is set when the blob is missing, truncated or cannot be parsed
+        as the identifier type claims, while a best-effort ``value`` is still returned when possible.
+        """
+        if id_blob is None:
+            return None, "missing IdBlob"
+
+        if id_type in ID_TYPE_STRING:
+            if len(id_blob) % 2:
+                return id_blob.decode("utf-16-le", errors="replace").rstrip("\x00"), "truncated UTF-16 IdBlob"
+            return id_blob.decode("utf-16-le", errors="replace").rstrip("\x00"), None
+
+        if id_type == ID_TYPE_SID:
+            try:
+                value = read_sid(id_blob)
+            except Exception as e:
+                return None, f"unparseable SID IdBlob: {e}"
+            if not value:
+                return None, "truncated SID IdBlob"
+            return value, None
+
+        return None, f"unknown IdType: {id_type}"
 
     def get_table(self, table_name: str | None = None, table_guid: str | None = None) -> Table | None:
         if all((table_name, table_guid)) or not any((table_name, table_guid)):
@@ -92,18 +165,120 @@ class SRU:
         for record in table.records():
             yield Entry(self, table, record)
 
+    def resolve_identity(self, value: int, column: str) -> Identity:
+        """Resolve an ``AppId``/``UserId`` reference, preserving every conflicting or malformed mapping.
+
+        The identifier is only attributed when exactly one type-correct, parseable value exists. Missing indices,
+        duplicate indices, truncated blobs and references whose ``IdType`` does not fit the column all produce an
+        :class:`Identity` whose status is :data:`UNDETERMINED`, together with the evidence explaining why.
+        """
+        mapping = self.id_map.get(value)
+        if mapping is None:
+            return Identity(
+                index=value,
+                column=column,
+                status=UNDETERMINED,
+                errors=[f"missing IdIndex mapping: {value}"],
+            )
+
+        expected_types = EXPECTED_ID_TYPES[column]
+        errors = list(mapping.conflicts)
+
+        candidates = []
+        for id_record in mapping.records:
+            if id_record.id_type not in expected_types:
+                errors.append(
+                    f"IdType {id_record.id_type} is not a valid {column} type "
+                    f"(expected one of {sorted(expected_types)})"
+                )
+                continue
+            if id_record.error:
+                errors.append(id_record.error)
+                continue
+            candidates.append(id_record)
+
+        distinct_values = {candidate.value for candidate in candidates}
+        # A conflicting IdIndex (duplicate rows with different IdType/IdBlob) can never be safely attributed,
+        # even if one of the rows happens to fit the column. The analyst must inspect the evidence instead.
+        if not mapping.conflicts and len(distinct_values) == 1:
+            return Identity(
+                index=value,
+                column=column,
+                status=next(iter(distinct_values)),
+                mapping=mapping,
+                errors=errors or None,
+            )
+
+        if len(distinct_values) > 1:
+            errors.append("conflicting identifier values for IdIndex %d" % value)
+
+        return Identity(
+            index=value,
+            column=column,
+            status=UNDETERMINED,
+            mapping=mapping,
+            errors=errors or None,
+        )
+
     def resolve_id(self, value: int) -> str | None:
-        try:
-            record = self.id_map[value]
-        except KeyError:
+        """Backwards-compatible identifier lookup.
+
+        Mirrors :meth:`resolve_identity` but returns the attributed string, ``None`` for an empty/undetermined
+        identity, and raises :class:`IndexError` for an index that has no mapping row at all.
+        """
+        mapping = self.id_map.get(value)
+        if mapping is None:
             raise IndexError(value)
 
-        if not record.get("IdBlob"):
+        identity = self.resolve_identity(value, APP_ID)
+        if identity.status == UNDETERMINED:
             return None
+        return identity.status
 
-        if record.get("IdType") in (0, 1, 2):
-            return record.get("IdBlob").decode("utf-16-le").rstrip("\x00")
-        return read_sid(record.get("IdBlob"))
+
+@dataclass
+class IdRecord:
+    """A single raw row of ``SruDbIdMapTable`` for a given ``IdIndex``."""
+
+    id_type: int | None
+    id_blob: bytes | None
+    value: str | None
+    error: str | None = None
+
+
+@dataclass
+class IdMapping:
+    """All ``SruDbIdMapTable`` rows sharing one ``IdIndex``, including duplicate/conflicting evidence."""
+
+    id_index: int | None
+    records: list[IdRecord] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+
+    def _detect_conflicts(self) -> list[str]:
+        conflicts = []
+        if len(self.records) > 1:
+            type_signatures = {(record.id_type, record.id_blob) for record in self.records}
+            if len(type_signatures) > 1:
+                conflicts.append(f"duplicate IdIndex {self.id_index} with conflicting IdType/IdBlob")
+        return conflicts
+
+
+@dataclass
+class Identity:
+    """The resolved attribution of an ``AppId``/``UserId`` reference, with full evidence."""
+
+    index: int | None
+    column: str
+    status: str
+    mapping: IdMapping | None = None
+    errors: list[str] | None = None
+
+    @property
+    def determined(self) -> bool:
+        return self.status != UNDETERMINED
+
+    def __str__(self) -> str:
+        return self.status
 
 
 class Entry:
@@ -113,13 +288,18 @@ class Entry:
         self.record = record
         self.provider = table.name
 
+    def identity(self, attr: str) -> Identity:
+        """Return the full :class:`Identity` (attribution plus evidence) for an ``AppId``/``UserId`` reference."""
+        index = self.record.get(attr)
+        return self.sru.resolve_identity(index, attr)
+
     def _get(self, attr: str) -> RecordValue:
         value = self.record.get(attr)
         if value is None:
             return value
 
-        if attr in ("AppId", "UserId"):
-            value = self.sru.resolve_id(value)
+        if attr in IDENTITY_COLUMNS:
+            value = self.identity(attr).status
 
         if attr == "TimeStamp":
             value = oatimestamp(value)
@@ -145,7 +325,14 @@ class Entry:
             return object.__getattribute__(self, attr)
 
     def __repr__(self) -> str:
+        # Render the stored columns, but substitute the raw AppId/UserId index with its attributed value so an
+        # undetermined identity is visible instead of looking like a valid numeric reference.
         column_values = serialise_record_column_values(self.record)
+        for attr in IDENTITY_COLUMNS:
+            if attr in self.table.column_names and self.record.get(attr) is not None:
+                column_values = column_values.replace(
+                    f"{attr}={self.record.get(attr)!r}", f"{attr}={self._get(attr)!r}", 1
+                )
         return f"<Entry provider={self.table.name!r} {column_values}>"
 
 
