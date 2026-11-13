@@ -115,8 +115,6 @@ class Record:
 class RecordData:
     """Record class for parsing and interacting with the on-disk record format.
 
-    Templated columns are currently not implemented.
-
     Args:
         table: The table this record is from.
         data: The node data of this record.
@@ -380,8 +378,12 @@ class RecordData:
     def _get_tagged(self, column: Column) -> bytes | None:
         """Parse a specific tagged column."""
         tag_field = None
+        value = None
 
-        idx = self._find_tag_field_idx(column.identifier)
+        # Columns inherited from a template table are stored as derived tagged fields (the fDerived bit is set on the
+        # TAGFLD), while a table's own tagged columns are stored as regular tagged fields. Look up the field with the
+        # same derived flag as the column so inherited values and the table's own values are never mixed up.
+        idx = self._find_tag_field_idx(column.identifier, is_derived=column.inherited)
         if idx is not None:
             tag_field = self._get_tag_field(idx)
 
@@ -433,16 +435,15 @@ class RecordData:
         min_idx = 0
         max_idx = self._tagged_data_count - 1
 
-        while min_idx != max_idx:
+        # Standard lower-bound binary search so any matching entry is found, even when the target identifier is not
+        # contiguous with the other tagged fields (which happens for sparse derived/own tagged column sets).
+        while min_idx < max_idx:
             test_idx = min_idx + (max_idx - min_idx) // 2
 
             tag_value = self._tagged_data_view[test_idx]
             value1 = flip_derived ^ (tag_value & mask)
             if value1 < value2:
                 min_idx = test_idx + 1
-            elif value1 == value2:
-                min_idx = test_idx
-                break
             else:
                 max_idx = test_idx
 
@@ -456,9 +457,10 @@ class RecordData:
 class TagField:
     """Represents a ``TAGFLD``, which contains information about a tagged field in a record."""
 
-    __slots__ = ("_offset", "flags", "has_extended_info", "identifier", "offset", "record")
+    __slots__ = ("_offset", "flags", "has_extended_info", "identifier", "is_null_small_page", "offset", "record")
 
     fNullSmallPage = 0x2000
+    fExtendedInfo = 0x4000
     fDerived = 0x8000
 
     def __init__(self, record: RecordData, value: int):
@@ -468,9 +470,11 @@ class TagField:
 
         if record.esedb.has_small_pages:
             self.offset = self._offset & 0x1FFF  # & maskIb
-            self.has_extended_info = bool(self._offset & 0x4000)  # & fExtendedInfo
+            self.is_null_small_page = bool(self._offset & TagField.fNullSmallPage)  # & fNullSmallPage
+            self.has_extended_info = bool(self._offset & TagField.fExtendedInfo)  # & fExtendedInfo
         else:
             self.offset = self._offset & 0x7FFF  # & maskIb
+            self.is_null_small_page = False
             self.has_extended_info = True
 
         if self.has_extended_info and len(self.record.data) >= self.record._tagged_data_start + self.offset:
@@ -485,7 +489,7 @@ class TagField:
     def is_null(self) -> bool:
         """Return whether this tagged field is null."""
         if self.record.esedb.has_small_pages:
-            return bool(self._offset & TagField.fNullSmallPage)
+            return self.is_null_small_page
         return bool(self.flags & TAGFLD_HEADER.Null)
 
     @property

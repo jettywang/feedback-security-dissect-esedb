@@ -14,7 +14,7 @@ from dissect.esedb.c_esedb import (
     JET_coltyp,
     RecordValue,
 )
-from dissect.esedb.exceptions import NoNeighbourPageError
+from dissect.esedb.exceptions import InvalidDatabase, NoNeighbourPageError
 from dissect.esedb.index import Index
 from dissect.esedb.record import Record
 
@@ -229,8 +229,18 @@ class Table:
         self._column_name_map[column.name] = column
         self._column_id_map[column.identifier] = column
 
-        # Precalculate fixed value offsets
-        if column.identifier < 128:
+        self._recalculate_fixed_offsets()
+
+    def _recalculate_fixed_offsets(self) -> None:
+        """Recalculate the offsets of the fixed columns.
+
+        Fixed columns are laid out in the record in the order of their column identifier, not in the order they
+        were added to the table. This matters for derived tables, where columns inherited from a template table can
+        be interleaved with the table's own columns when the catalog entries are merged.
+        """
+        self._fixed_value_offset = 0
+        fixed_columns = (column for column in self.columns if column.identifier < 128)
+        for column in sorted(fixed_columns, key=lambda c: c.identifier):
             column._offset = self._fixed_value_offset
             self._fixed_value_offset += column.size
 
@@ -241,10 +251,20 @@ class Table:
 
 
 class Column:
-    def __init__(self, identifier: int, name: str, type_: JET_coltyp, record: Record | None = None):
+    def __init__(
+        self,
+        identifier: int,
+        name: str,
+        type_: JET_coltyp,
+        record: Record | None = None,
+        inherited: bool = False,
+    ):
         self.identifier = identifier
         self.name = name
         self.type = type_
+
+        # Whether this column was inherited from a template table
+        self.inherited = inherited
 
         # Set by the table when added, only relevant for fixed value columns
         self._offset = None
@@ -253,6 +273,10 @@ class Column:
 
     def __repr__(self) -> str:
         return f"<Column name={self.name!r} identifier={self.identifier:#x} type={self.type} size={self.size}>"
+
+    def inherit(self) -> Column:
+        """Return a copy of this column marked as inherited from a template table."""
+        return Column(self.identifier, self.name, self.type, record=self.record, inherited=True)
 
     @property
     def offset(self) -> int:
@@ -351,6 +375,8 @@ class Catalog:
         # Create a dummy table with a preset list of columns
         self._ctable = Table(esedb, None, root_page, columns=self.CATALOG_COLUMNS)
 
+        # First pass: parse the catalog records into tables, their own columns and indexes. Columns inherited from
+        # template tables are not present in the catalog for a derived table, so they are resolved in a second pass.
         cur_table = None
         for rec in self._ctable.records():
             rtype = rec.get("Type")
@@ -372,6 +398,71 @@ class Catalog:
 
             elif rtype == SYSOBJ.Callback:
                 cur_table._long_callback_record = rec
+
+        # Second pass: merge the columns of any referenced template tables into their derived tables.
+        for table in self.tables:
+            self._resolve_template(table)
+
+    def _resolve_template(self, table: Table, _seen: list[str] | None = None) -> None:
+        """Resolve the template table of a derived table.
+
+        Template tables allow a table to inherit columns (and their defaults) from another table. The inherited
+        columns keep the identifiers they have in the template, while the derived table may define additional columns
+        with their own identifiers. The columns are merged here so that record parsing can locate every field based
+        on its identifier and the fixed/variable/tagged layout of the record.
+
+        Args:
+            table: The table to resolve the template for.
+            _seen: The ordered names of the tables currently being resolved, used to detect inheritance cycles.
+
+        Raises:
+            InvalidDatabase: If the template table is missing, the inheritance contains a cycle or the template
+                defines a column that conflicts with a column of the derived table.
+        """
+        template_name = table.record.get("TemplateTable")
+        if not template_name:
+            return
+
+        if _seen is None:
+            _seen = []
+
+        if table.name in _seen:
+            chain = " -> ".join([*_seen, table.name])
+            raise InvalidDatabase(f"Cyclic template table inheritance detected: {chain}")
+
+        try:
+            template = self._table_name_map[template_name]
+        except KeyError:
+            raise InvalidDatabase(
+                f"Table {table.name!r} references missing template table {template_name!r}"
+            ) from None
+
+        # Make sure the entire template chain (including its own template) is resolved before inheriting its columns
+        self._resolve_template(template, [*_seen, table.name])
+
+        own_ids = {column.identifier for column in table.columns}
+        own_names = {column.name for column in table.columns}
+
+        inherited_columns = []
+        for column in template.columns:
+            if column.identifier in own_ids:
+                raise InvalidDatabase(
+                    f"Column identifier conflict for {column.identifier} in table {table.name!r} "
+                    f"and template {template_name!r}"
+                )
+            if column.name in own_names:
+                raise InvalidDatabase(
+                    f"Column name conflict for {column.name!r} in table {table.name!r} "
+                    f"and template {template_name!r}"
+                )
+            inherited_columns.append(column.inherit())
+
+        # Inherited columns come first, matching how the engine builds the logical column set of a derived table.
+        # Fixed column offsets are (re)calculated based on column identifier, independent of insertion order.
+        table.columns = inherited_columns + table.columns
+        table._column_name_map = {column.name: column for column in table.columns}
+        table._column_id_map = {column.identifier: column for column in table.columns}
+        table._recalculate_fixed_offsets()
 
     def table(self, name: str) -> Table:
         """Retrieve the table with the given name.
