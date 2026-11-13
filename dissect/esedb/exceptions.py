@@ -6,6 +6,10 @@ class InvalidDatabase(Error):
     pass
 
 
+class InvalidPage(Error):
+    pass
+
+
 class KeyNotFoundError(Error):
     pass
 

@@ -5,6 +5,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 from dissect.esedb.c_esedb import PAGE_FLAG, TAG_FLAG, c_esedb
+from dissect.esedb.exceptions import InvalidPage
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -27,6 +28,8 @@ class Page:
         self.buf = memoryview(buf)
 
         data_start = len(c_esedb.PGHDR)
+        if len(self.buf) < data_start:
+            raise InvalidPage(f"Page {num} is too small for a page header: {len(self.buf)} bytes")
         self.header = c_esedb.PGHDR(self.buf)
         self.header2 = None
         if not self.is_small_page:
@@ -39,6 +42,11 @@ class Page:
         self.next_page = self.header.pgnoNext
 
         data_end = self.header.ibMicFree
+        if data_start + data_end > len(self.buf):
+            raise InvalidPage(
+                f"Page {num} data extends beyond the page body: "
+                f"data start {data_start:#x}, data end {data_start + data_end:#x}, page size {len(self.buf):#x}"
+            )
         self.data = self.buf[data_start : data_start + data_end]
 
         # On newer versions, itagMicFree was renamed to itagState and
@@ -46,6 +54,17 @@ class Page:
         self.tag_reserved = (self.header.itagState >> 12) or 1
         self.tag_count = self.header.itagState & 0x0FFF
         self.node_count = self.tag_count - self.tag_reserved
+
+        # The tag array grows downwards from the end of the page. It must not overlap the page data,
+        # otherwise a corrupt tag can point into the data of another node.
+        tag_array_start = len(self.buf) - self.tag_count * 4
+        if self.tag_count and tag_array_start < data_start + data_end:
+            raise InvalidPage(
+                f"Page {num} tag array overlaps page data: "
+                f"tag array starts at {tag_array_start:#x}, "
+                f"data ends at {data_start + data_end:#x}"
+            )
+
         self._node_cls = LeafNode if self.is_leaf else BranchNode
         self._node_cache = {}
 
@@ -180,6 +199,8 @@ class Tag:
         self.num = num
 
         tag_offset = len(page.buf) + ((num + 1) * -4)
+        if tag_offset < 0 or tag_offset + 4 > len(page.buf):
+            raise InvalidPage(f"Tag {num} is outside the page: offset {tag_offset}")
         tag_buf = page.buf[tag_offset : tag_offset + 4]
 
         self.tag = c_esedb.TAG(tag_buf)
@@ -191,7 +212,14 @@ class Tag:
         if self.size == 0 and self.num != 0:
             raise ValueError("Invalid TAG data, corrupt database?")
 
-        self.data = self.page.data[self.offset : self.offset + self.size]
+        data_end = self.offset + self.size
+        if data_end > len(page.data):
+            raise InvalidPage(
+                f"Tag {num} data extends beyond the page body: "
+                f"offset {self.offset:#x}, size {self.size:#x}, data size {len(page.data):#x}"
+            )
+
+        self.data = self.page.data[self.offset : data_end]
 
         flags = 0
         if page.is_small_page:
@@ -226,23 +254,42 @@ class Node:
         offset = 0
 
         key_prefix = b""
-        key_prefix_size = None
 
         # Large pages have the tag flags encoded in the 3 MSB of the first word, so we have to mask the first 13 bits
         # See also the Tag class
-        if len(buf) >= offset + 2 and tag.flags & TAG_FLAG.Compressed:
+        if tag.flags & TAG_FLAG.Compressed:
+            if len(buf) < 2:
+                raise InvalidPage(f"Node {self.num} is too small to contain a key prefix reference")
+
             key_prefix_size = struct.unpack("<H", buf[:2])[0] & 0x1FFF
-            key_prefix = self.tag.page.key_prefix[:key_prefix_size].ljust(key_prefix_size, b"\x00")
+            page_prefix = tag.page.key_prefix
+            if page_prefix is None:
+                raise InvalidPage(f"Node {self.num} references a key prefix, but page has none: {tag.page}")
+            if key_prefix_size > len(page_prefix):
+                raise InvalidPage(
+                    f"Node {self.num} key prefix reference exceeds common prefix: "
+                    f"reference {key_prefix_size:#x}, common prefix {len(page_prefix):#x}"
+                )
+
+            # Slice exactly to the referenced size, don't silently pad a short common prefix
+            key_prefix = page_prefix[:key_prefix_size]
             offset += 2
 
-        key_suffix = b""
-        key_suffix_size = None
+        if len(buf) < offset + 2:
+            raise InvalidPage(f"Node {self.num} is too small to contain a key suffix length")
 
-        if len(buf) >= offset + 2:
-            key_suffix_size = struct.unpack("<H", buf[offset : offset + 2])[0] & 0x1FFF
-            offset += 2
-            key_suffix = buf[offset : offset + key_suffix_size]
-            offset += key_suffix_size
+        key_suffix_size = struct.unpack("<H", buf[offset : offset + 2])[0] & 0x1FFF
+        offset += 2
+
+        key_suffix_end = offset + key_suffix_size
+        if key_suffix_end > len(buf):
+            raise InvalidPage(
+                f"Node {self.num} key suffix extends beyond tag data: "
+                f"suffix end {key_suffix_end:#x}, tag size {len(buf):#x}"
+            )
+
+        key_suffix = buf[offset:key_suffix_end]
+        offset = key_suffix_end
 
         self.key = key_prefix + key_suffix
         self.key_prefix = key_prefix
@@ -264,6 +311,8 @@ class BranchNode(Node):
 
     def __init__(self, tag: Tag):
         super().__init__(tag)
+        if len(self.data) < 4:
+            raise InvalidPage(f"Branch node {self.num} is too small to contain a child page number")
         self.child = struct.unpack("<I", self.data[:4])[0]
 
     def __repr__(self) -> str:
