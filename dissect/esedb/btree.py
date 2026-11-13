@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from dissect.esedb.exceptions import KeyNotFoundError, NoNeighbourPageError
 
@@ -9,10 +9,27 @@ if TYPE_CHECKING:
     from dissect.esedb.page import Node, Page
 
 
+class BTreePosition(NamedTuple):
+    """An immutable position within a :class:`BTree`.
+
+    A position only captures the page number and node index of the traversal. It does not copy any page data:
+    pages are shared, effectively immutable objects that are cached on the :class:`~dissect.esedb.esedb.EseDB`
+    instance. Saving a position is therefore a snapshot of the traversal state only, not of the underlying data.
+    """
+
+    page_num: int
+    node_num: int
+
+
 class BTree:
     """A simple implementation for searching the ESE B+Trees.
 
     This is a stateful interactive class that moves an internal cursor to a position within the BTree.
+
+    A position is fully described by a page number and a node index, and can be captured in an immutable
+    :class:`BTreePosition`. Use :meth:`position` and :meth:`restore` to temporarily move the tree and return to
+    the exact same node, or :meth:`fork` to create an independent traversal over the same (shared, immutable)
+    pages without copying the database.
 
     Args:
         esedb: An instance of :class:`~dissect.esedb.esedb.EseDB`.
@@ -36,9 +53,72 @@ class BTree:
 
     def reset(self) -> None:
         """Reset the internal state to the root of the BTree."""
-        self._page = self.root
-        self._page_num = self._page.num
-        self._node_num = 0
+        self._set_position(BTreePosition(self.root.num, 0))
+
+    def fork(self) -> BTree:
+        """Create an independent traversal of the same tree at the current position.
+
+        The returned :class:`BTree` shares this tree's database and (cached, immutable) pages but has its own
+        position. Moving the fork never moves this tree and vice versa. No page data is copied.
+        """
+        fork = BTree(self.esedb, self.root)
+        fork.restore(self.position())
+        return fork
+
+    def position(self) -> BTreePosition:
+        """Return an immutable snapshot of the current position.
+
+        The snapshot only covers the traversal position (page number and node index). Page data is not copied;
+        restore the snapshot with :meth:`restore` as long as the same :class:`~dissect.esedb.esedb.EseDB`
+        instance and pages are still available.
+        """
+        return BTreePosition(self._page_num, self._node_num)
+
+    def restore(self, position: BTreePosition) -> None:
+        """Restore a position previously returned by :meth:`position`.
+
+        Args:
+            position: The position to restore.
+        """
+        self._set_position(position)
+
+    @property
+    def is_leaf(self) -> bool:
+        """Return whether the BTree is currently positioned on a leaf page."""
+        return self._page.is_leaf
+
+    def first(self) -> Node:
+        """Move the BTree to the first node in the tree (the leftmost leaf node).
+
+        Returns:
+            A :class:`~dissect.esedb.page.Node` object of the first node.
+        """
+        page = self.root
+        while page.is_branch:
+            node = page.node(0)
+            page = self.esedb.page(node.child)  # type: ignore[union-attr]
+
+        self._set_position(BTreePosition(page.num, 0))
+        return self.node()
+
+    def last(self) -> Node:
+        """Move the BTree to the last node in the tree (the rightmost leaf node).
+
+        Returns:
+            A :class:`~dissect.esedb.page.Node` object of the last node.
+        """
+        page = self.root
+        while page.is_branch:
+            node = page.node(page.node_count - 1)
+            page = self.esedb.page(node.child)  # type: ignore[union-attr]
+
+        self._set_position(BTreePosition(page.num, page.node_count - 1))
+        return self.node()
+
+    def _set_position(self, position: BTreePosition) -> None:
+        self._page_num = position.page_num
+        self._node_num = position.node_num
+        self._page = self.esedb.page(self._page_num)
 
     def node(self) -> Node:
         """Return the node the BTree is currently on.
@@ -105,7 +185,9 @@ class BTree:
     def search(self, key: bytes, exact: bool = True) -> Node:
         """Search the tree for the given ``key``.
 
-        Moves the BTree to the matching node, or on the last node that is less than the requested key.
+        Moves the BTree to the matching node, or on the last node that is less than the requested key. When an
+        ``exact`` search fails, :class:`~dissect.esedb.exceptions.KeyNotFoundError` is raised and the position is
+        left unchanged, so a failed lookup can never disturb another traversal sharing this tree's pages.
 
         Args:
             key: The key to search for.
@@ -121,13 +203,13 @@ class BTree:
             if page.is_branch:
                 page = self.esedb.page(node.child)
             else:
+                if exact and key != node.key:
+                    raise KeyNotFoundError(f"Can't find key: {key}")
+
                 self._page = page
                 self._page_num = page.num
                 self._node_num = node.num
                 break
-
-        if exact and key != node.key:
-            raise KeyNotFoundError(f"Can't find key: {key}")
 
         return self.node()
 
